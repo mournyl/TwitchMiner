@@ -26,18 +26,27 @@ Each account runs as its own node, optionally through its own proxy.
 - **Your own proxies** — import, test and assign a proxy per account in their own tab, with automatic failover
 - **Reward pictures** — each drop shows its reward image
 
-## Install
+## Download (Windows)
 
-Download **`mournylTwitchMiner.exe`** from the latest release and run it — keep the `fonts` folder next to it.
+1. Grab the latest **`mournyl-miner-windows.zip`** from the [Releases](../../releases) page.
+2. Unzip it anywhere, keeping **`mournylTwitchMiner.exe`** and the **`fonts`** folder together.
+3. Run **`mournylTwitchMiner.exe`**.
 
-Or run from source (Python 3.10+):
+On first launch the app creates a `data` folder next to the exe for your accounts.
+
+> [!NOTE]
+> The exe isn't code-signed, so Windows may warn that the publisher is unverified. If you see **SmartScreen**, click **More info → Run anyway**. If **Smart App Control** blocks it (some fresh Windows 11 installs), run from source instead — see below.
+
+## Run from source
+
+Works on any OS with Python 3.10+ and sidesteps the Windows warnings.
 
 ```bash
 pip install -r requirements.txt
 python app.py
 ```
 
-Accounts are added with Twitch's device-code login: click **+ Add account** and approve in the browser.
+Adding accounts (either way): click **+ Add account** and approve the Twitch device-code login in your browser.
 
 ## Data
 

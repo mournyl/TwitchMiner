@@ -2056,7 +2056,8 @@ class MainWindow(QMainWindow):
         threading.Thread(target=worker, daemon=True).start()
 
     def _stage_update(self, url: str) -> str:
-        """Download the release zip and extract it into app_dir/update_tmp."""
+        """Download the release zip and extract it into app_dir/update_tmp.
+        Returns the path to the folder that holds the new exe + fonts."""
         app_dir = DATA_DIR.parent
         stage = app_dir / "update_tmp"
         shutil.rmtree(stage, ignore_errors=True)
@@ -2069,29 +2070,63 @@ class MainWindow(QMainWindow):
                 for chunk in r.iter_content(chunk_size=65536):
                     if chunk:
                         f.write(chunk)
+        # Validate the zip before touching anything.
         with zipfile.ZipFile(zpath) as z:
+            if z.testzip() is not None:
+                raise RuntimeError("downloaded update is corrupt")
             z.extractall(extracted)
-        return str(stage)
+        # Find the new exe wherever it landed (zip may wrap it in a folder).
+        exe_name = Path(sys.executable).name
+        matches = list(extracted.rglob(exe_name))
+        if not matches:
+            exes = list(extracted.rglob("*.exe"))
+            if not exes:
+                raise RuntimeError("update did not contain an .exe")
+            matches = exes
+        src_dir = matches[0].parent
+        return str(src_dir)
 
-    def _launch_updater_and_quit(self, stage: str) -> None:
-        """Write a batch that waits for this exe to close, copies the new
-        files over the old, and relaunches — then quit so it can run."""
+    def _launch_updater_and_quit(self, src_dir: str) -> None:
+        """Write a batch that waits for this exe to close, replaces it (and the
+        fonts folder) with the downloaded copy, clears stale onefile temp
+        folders, then relaunches — and quit so the batch can run."""
         app_dir = str(DATA_DIR.parent)
         exe = sys.executable
         exe_name = Path(exe).name
-        extracted = Path(stage) / "extracted"
-        entries = list(extracted.iterdir())
-        src = entries[0] if len(entries) == 1 and entries[0].is_dir() else extracted
+        stage = str(DATA_DIR.parent / "update_tmp")
+        new_exe = str(Path(src_dir) / exe_name)
         bat = Path(tempfile.gettempdir()) / "mournyl_apply_update.bat"
         bat.write_text(
             "@echo off\r\n"
             "echo Updating mournyl miner...\r\n"
+            # Bail out if the new exe somehow isn't there — never overwrite with nothing.
+            f'if not exist "{new_exe}" (\r\n'
+            '  echo Update files missing - aborting, your current version is untouched.\r\n'
+            '  timeout /t 4 /nobreak >nul\r\n'
+            f'  rmdir /s /q "{stage}" 2>nul\r\n'
+            f'  start "" "{exe}"\r\n'
+            '  del "%~f0"\r\n'
+            '  exit /b\r\n'
+            ')\r\n'
             ":wait\r\n"
             f'tasklist /fi "imagename eq {exe_name}" | find /i "{exe_name}" >nul\r\n'
             "if not errorlevel 1 ( timeout /t 1 /nobreak >nul & goto wait )\r\n"
-            f'xcopy /E /Y /I "{src}\\*" "{app_dir}\\" >nul\r\n'
+            # Give Windows a moment to release the file lock after the process exits.
+            "timeout /t 1 /nobreak >nul\r\n"
+            # Replace the exe (retry a few times in case AV/lock is slow to clear).
+            "set tries=0\r\n"
+            ":copyexe\r\n"
+            f'copy /y "{new_exe}" "{app_dir}\\{exe_name}" >nul\r\n'
+            "if errorlevel 1 (\r\n"
+            "  set /a tries+=1\r\n"
+            "  if %tries% lss 5 ( timeout /t 1 /nobreak >nul & goto copyexe )\r\n"
+            ")\r\n"
+            # Refresh the fonts folder if the update shipped one.
+            f'if exist "{src_dir}\\fonts" xcopy /E /Y /I "{src_dir}\\fonts" "{app_dir}\\fonts" >nul\r\n'
+            # Clear stale onefile extraction folders so the new exe unpacks clean.
+            'for /d %%D in ("%TEMP%\\_MEI*") do rmdir /s /q "%%D" 2>nul\r\n'
             f'rmdir /s /q "{stage}" 2>nul\r\n'
-            f'start "" "{exe}"\r\n'
+            f'start "" "{app_dir}\\{exe_name}"\r\n'
             'del "%~f0"\r\n',
             encoding="utf-8")
         subprocess.Popen(["cmd", "/c", str(bat)], creationflags=0x00000010)  # CREATE_NEW_CONSOLE
