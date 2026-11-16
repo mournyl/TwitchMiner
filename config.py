@@ -103,6 +103,10 @@ ACCOUNTS_PATH = DATA_DIR / "accounts.json"
 # flip to True to bring the full per-request diagnostics back.
 DEBUG_LOG = False
 
+# In-app updater: compared against the latest GitHub release.
+APP_VERSION = "1.0"
+GITHUB_REPO = "mournyl/TwitchMiner"
+
 
 class Settings:
     def __init__(self, filename: str = "settings.json"):

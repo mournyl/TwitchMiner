@@ -5,11 +5,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import queue
 import sys
 import threading
 import time
 import re
+import shutil
+import subprocess
+import tempfile
+import zipfile
 
 import requests
 from PyQt6.QtCore import QEvent, QPointF, QSize, QTimer, Qt
@@ -24,7 +29,7 @@ from PyQt6.QtWidgets import (
 
 from auth import login, validate_token
 from pathlib import Path
-from config import ACCOUNTS_PATH, DATA_DIR, Settings
+from config import ACCOUNTS_PATH, APP_VERSION, DATA_DIR, GITHUB_REPO, Settings
 from miner import AccountNodeState, MiningNode, Miner
 from proxies import SCHEMES, ProxyStore, describe_error, make_failover, mask
 
@@ -808,6 +813,13 @@ class HomePage(QWidget):
         self.chk_strict.toggled.connect(win._set_strict_game)
         opts_card.body.addWidget(self.chk_auto_claim)
         opts_card.body.addWidget(self.chk_strict)
+        self.btn_check_update = styled_button("Check for updates", "ghost")
+        self.btn_check_update.clicked.connect(lambda: win._check_for_updates(manual=True))
+        opts_card.body.addWidget(self.btn_check_update)
+        self.lbl_version = QLabel(f"v{APP_VERSION}")
+        self.lbl_version.setObjectName("muted")
+        self.lbl_version.setToolTip("Latest release version on GitHub (checked at launch).")
+        opts_card.body.addWidget(self.lbl_version)
         side.addWidget(opts_card)
 
         # ---- proxy progress ----
@@ -996,7 +1008,7 @@ class HomePage(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("mournyl miner")
+        self.setWindowTitle("mournyl TwitchMiner")
         self.resize(1100, 820)
 
         self.settings = Settings()
@@ -1041,6 +1053,8 @@ class MainWindow(QMainWindow):
         self._ui_timer = QTimer()
         self._ui_timer.timeout.connect(self._drain_ui_calls)
         self._ui_timer.start(150)
+        # Quiet check for a newer GitHub release shortly after startup.
+        QTimer.singleShot(4000, lambda: self._check_for_updates(manual=False))
 
         # App first, proxies second: the window is up before any network
         # work; account start-up and the proxy check run in the background.
@@ -1074,6 +1088,8 @@ class MainWindow(QMainWindow):
         drops_left.setSpacing(10)
         drops_left.addWidget(caption("Nodes"))
         self.drops_node_list = QListWidget()
+        self.drops_node_list.setMinimumWidth(190)
+        self.drops_node_list.setWordWrap(True)
         self.drops_node_list.currentRowChanged.connect(self._sync_node_row)
         drops_left.addWidget(self.drops_node_list, 1)
 
@@ -1307,7 +1323,13 @@ class MainWindow(QMainWindow):
         self.tabs_main.setCornerWidget(actions, Qt.Corner.TopRightCorner)
 
         self.setCentralWidget(self.tabs_main)
-        self.tabs_main.currentChanged.connect(lambda i: self.home.refresh() if i == 0 else None)
+        self.tabs_main.currentChanged.connect(self._on_main_tab_changed)
+
+    def _on_main_tab_changed(self, index: int) -> None:
+        if index == 0:            # Home
+            self.home.refresh()
+        elif index == 2:          # Node settings — refresh its live-streamer list
+            self._refresh_streamer_list()
 
     def _sync_node_row(self, row: int) -> None:
         """Drops-tab node list -> Node-settings list (the one that drives selection)."""
@@ -1893,6 +1915,8 @@ class MainWindow(QMainWindow):
                 QTableWidgetItem(status),
             ]
             cells[0].setData(Qt.ItemDataRole.UserRole, d.drop_id)
+            cells[0].setToolTip(d.game_name)
+            cells[1].setToolTip(d.drop_name)
             pix = self._drop_pixmap(d.image_url)
             if pix is not None:
                 cells[1].setIcon(QIcon(pix))
@@ -1941,8 +1965,9 @@ class MainWindow(QMainWindow):
                 try:
                     _, channels = gql.get_live_channels_for_game(g)
                     self._game_live[g.lower()] = bool(channels)
-                except Exception:
-                    pass  # leave the previous value on a transient error
+                    node.node._log(f"game-live: {g} -> {len(channels)} live streamer(s)")
+                except Exception as e:
+                    node.node._log(f"game-live check failed for {g}: {e}")
         finally:
             self._game_live_running = False
 
@@ -1957,6 +1982,8 @@ class MainWindow(QMainWindow):
         self.tray.setToolTip("mournyl miner")
         menu = QMenu()
         menu.addAction("Show").triggered.connect(self._restore_from_tray)
+        menu.addAction("Check for updates").triggered.connect(
+            lambda: self._check_for_updates(manual=True))
         menu.addSeparator()
         menu.addAction("Quit").triggered.connect(self._quit_app)
         self.tray.setContextMenu(menu)
@@ -1977,6 +2004,125 @@ class MainWindow(QMainWindow):
             self.tray.hide()
         QApplication.quit()
 
+    # ---- updates ----------------------------------------------------------
+    def _check_for_updates(self, manual: bool = False) -> None:
+        def worker():
+            info = check_latest_release()
+            self._post(self._update_check_done, info, manual)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _update_check_done(self, info, manual: bool) -> None:
+        if not info:
+            if manual:
+                QMessageBox.information(self, "Updates",
+                                        "Couldn't reach GitHub to check for updates.")
+            return
+        # Pull the release's version name onto the Home screen.
+        self.home.lbl_version.setText(info["tag"] or f"v{info['version']}")
+        if _version_tuple(info["version"]) <= _version_tuple(APP_VERSION):
+            if manual:
+                QMessageBox.information(self, "Updates",
+                                        f"You're on the latest version ({APP_VERSION}).")
+            return
+        newer = info["version"] or info["tag"]
+        if not getattr(sys, "frozen", False):
+            if QMessageBox.question(self, "Update available",
+                    f"Version {newer} is available (you have {APP_VERSION}).\n\n"
+                    "Update now? This pulls the latest from GitHub and restarts.",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                    ) == QMessageBox.StandardButton.Yes:
+                self._apply_source_update()
+            return
+        if not info["url"]:
+            QMessageBox.information(self, "Update available",
+                f"Version {newer} is available, but that release has no .zip to download.")
+            return
+        if QMessageBox.question(self, "Update available",
+                f"Version {newer} is available (you have {APP_VERSION}).\n\n"
+                "Download and install it now? The app will close and reopen.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                ) == QMessageBox.StandardButton.Yes:
+            self._download_and_apply_update(info)
+
+    def _download_and_apply_update(self, info) -> None:
+        def worker():
+            try:
+                stage = self._stage_update(info["url"])
+            except Exception as e:
+                self._post(lambda e=e: QMessageBox.warning(
+                    self, "Update failed", f"Could not download the update:\n{e}"))
+                return
+            self._post(self._launch_updater_and_quit, stage)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _stage_update(self, url: str) -> str:
+        """Download the release zip and extract it into app_dir/update_tmp."""
+        app_dir = DATA_DIR.parent
+        stage = app_dir / "update_tmp"
+        shutil.rmtree(stage, ignore_errors=True)
+        extracted = stage / "extracted"
+        extracted.mkdir(parents=True, exist_ok=True)
+        zpath = stage / "update.zip"
+        with requests.get(url, stream=True, timeout=120) as r:
+            r.raise_for_status()
+            with open(zpath, "wb") as f:
+                for chunk in r.iter_content(chunk_size=65536):
+                    if chunk:
+                        f.write(chunk)
+        with zipfile.ZipFile(zpath) as z:
+            z.extractall(extracted)
+        return str(stage)
+
+    def _launch_updater_and_quit(self, stage: str) -> None:
+        """Write a batch that waits for this exe to close, copies the new
+        files over the old, and relaunches — then quit so it can run."""
+        app_dir = str(DATA_DIR.parent)
+        exe = sys.executable
+        exe_name = Path(exe).name
+        extracted = Path(stage) / "extracted"
+        entries = list(extracted.iterdir())
+        src = entries[0] if len(entries) == 1 and entries[0].is_dir() else extracted
+        bat = Path(tempfile.gettempdir()) / "mournyl_apply_update.bat"
+        bat.write_text(
+            "@echo off\r\n"
+            "echo Updating mournyl miner...\r\n"
+            ":wait\r\n"
+            f'tasklist /fi "imagename eq {exe_name}" | find /i "{exe_name}" >nul\r\n'
+            "if not errorlevel 1 ( timeout /t 1 /nobreak >nul & goto wait )\r\n"
+            f'xcopy /E /Y /I "{src}\\*" "{app_dir}\\" >nul\r\n'
+            f'rmdir /s /q "{stage}" 2>nul\r\n'
+            f'start "" "{exe}"\r\n'
+            'del "%~f0"\r\n',
+            encoding="utf-8")
+        subprocess.Popen(["cmd", "/c", str(bat)], creationflags=0x00000010)  # CREATE_NEW_CONSOLE
+        self._quit_app()
+
+    def _apply_source_update(self) -> None:
+        """Running from source: pull the latest from the git clone and restart,
+        with no need to open GitHub. Needs git and a .git folder."""
+        app_dir = str(DATA_DIR.parent)
+        if not ((Path(app_dir) / ".git").exists() and shutil.which("git")):
+            QMessageBox.information(self, "Update",
+                "Auto-update from source needs this folder to be a git clone with "
+                "git installed. Run \"git pull\" here and restart.")
+            return
+        py = sys.executable
+        script = str(Path(app_dir) / "app.py")
+        pid = os.getpid()
+        bat = Path(tempfile.gettempdir()) / "mournyl_src_update.bat"
+        bat.write_text(
+            "@echo off\r\n"
+            "echo Updating mournyl TwitchMiner...\r\n"
+            ":wait\r\n"
+            f'tasklist /fi "pid eq {pid}" | find "{pid}" >nul\r\n'
+            "if not errorlevel 1 ( timeout /t 1 /nobreak >nul & goto wait )\r\n"
+            f'git -C "{app_dir}" pull\r\n'
+            f'start "" "{py}" "{script}"\r\n'
+            'del "%~f0"\r\n',
+            encoding="utf-8")
+        subprocess.Popen(["cmd", "/c", str(bat)], creationflags=0x00000010)
+        self._quit_app()
+
     def changeEvent(self, event) -> None:
         # Minimize sends the window to the tray instead of the taskbar.
         if (event.type() == QEvent.Type.WindowStateChange
@@ -1996,7 +2142,7 @@ class MainWindow(QMainWindow):
             self.home.refresh()
             self._refresh_games_dropdown()
             self._update_games_list()
-            self._maybe_check_games_live()
+        self._maybe_check_games_live()
         for i in range(self.account_list_widget.count()):
             it = self.account_list_widget.item(i)
             n = self.nodes.get(it.text())
@@ -2018,6 +2164,7 @@ class MainWindow(QMainWindow):
                     text = f"{it.text()}\n{line}"
                     if d_it.text() != text:
                         d_it.setText(text)
+                        d_it.setToolTip(text)
                     d_it.setIcon(icon)
         if self.offline_accounts:
             self.lbl_offline.setText("Not running yet:\n" + "\n".join(
@@ -2149,6 +2296,38 @@ def _app_icon_path() -> str:
             if p.exists():
                 return str(p)
     return ""
+
+
+GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+
+
+def _version_tuple(v: str) -> tuple:
+    nums = [int(n) for n in re.findall(r"\d+", v or "")][:4]
+    while len(nums) < 3:
+        nums.append(0)
+    return tuple(nums)
+
+
+def check_latest_release() -> dict | None:
+    """Latest GitHub release as {'version','tag','url','notes'}, or None on any
+    error. Network call — run off the UI thread."""
+    try:
+        r = requests.get(GITHUB_API_LATEST, timeout=15,
+                         headers={"Accept": "application/vnd.github+json"})
+        r.raise_for_status()
+        data = r.json()
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    tag = data.get("tag_name") or ""
+    zip_url = ""
+    for a in data.get("assets") or []:
+        if (a.get("name") or "").lower().endswith(".zip"):
+            zip_url = a.get("browser_download_url") or ""
+            break
+    return {"version": tag.lstrip("vV"), "tag": tag, "url": zip_url,
+            "notes": data.get("body") or ""}
 
 
 def main():
