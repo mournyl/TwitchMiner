@@ -756,7 +756,7 @@ class HomePage(QWidget):
         # ---- stat tiles ----
         tiles = QHBoxLayout()
         tiles.setSpacing(12)
-        self.t_nodes = StatTile("Nodes running")
+        self.t_nodes = StatTile("Active nodes")
         self.t_proxies = StatTile("Working proxies")
         self.t_watching = StatTile("Watching now")
         self.t_ready = StatTile("Drops ready to claim", hot=True)
@@ -818,7 +818,7 @@ class HomePage(QWidget):
         opts_card.body.addWidget(self.btn_check_update)
         self.lbl_version = QLabel(f"v{APP_VERSION}")
         self.lbl_version.setObjectName("muted")
-        self.lbl_version.setToolTip("Latest release version on GitHub (checked at launch).")
+        self.lbl_version.setToolTip("The version you're running. Checks GitHub for newer on launch.")
         opts_card.body.addWidget(self.lbl_version)
         side.addWidget(opts_card)
 
@@ -2017,8 +2017,13 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, "Updates",
                                         "Couldn't reach GitHub to check for updates.")
             return
-        # Pull the release's version name onto the Home screen.
-        self.home.lbl_version.setText(info["tag"] or f"v{info['version']}")
+        # The Home label always shows the version THIS build is (APP_VERSION).
+        # If a newer release exists, note it alongside — never overwrite the
+        # running version, or the label would misreport what's installed.
+        if _version_tuple(info["version"]) > _version_tuple(APP_VERSION):
+            self.home.lbl_version.setText(f"v{APP_VERSION}  (v{info['version']} available)")
+        else:
+            self.home.lbl_version.setText(f"v{APP_VERSION}")
         if _version_tuple(info["version"]) <= _version_tuple(APP_VERSION):
             if manual:
                 QMessageBox.information(self, "Updates",
@@ -2123,6 +2128,7 @@ class MainWindow(QMainWindow):
             ")\r\n"
             # Refresh the fonts folder if the update shipped one.
             f'if exist "{src_dir}\\fonts" xcopy /E /Y /I "{src_dir}\\fonts" "{app_dir}\\fonts" >nul\r\n'
+            f'if exist "{src_dir}\\assets" xcopy /E /Y /I "{src_dir}\\assets" "{app_dir}\\assets" >nul\r\n'
             # Clear stale onefile extraction folders so the new exe unpacks clean.
             'for /d %%D in ("%TEMP%\\_MEI*") do rmdir /s /q "%%D" 2>nul\r\n'
             f'rmdir /s /q "{stage}" 2>nul\r\n'

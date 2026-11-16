@@ -104,7 +104,7 @@ ACCOUNTS_PATH = DATA_DIR / "accounts.json"
 DEBUG_LOG = False
 
 # In-app updater: compared against the latest GitHub release.
-APP_VERSION = "1.0"
+APP_VERSION = "1.4"
 GITHUB_REPO = "mournyl/TwitchMiner"
 
 
