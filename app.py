@@ -12,13 +12,14 @@ import time
 import re
 
 import requests
-from PyQt6.QtCore import QPointF, QSize, QTimer, Qt
+from PyQt6.QtCore import QEvent, QPointF, QSize, QTimer, Qt
 from PyQt6.QtGui import QColor, QFont, QFontDatabase, QIcon, QPainter, QPalette, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog, QFrame,
     QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMessageBox, QProgressBar, QPushButton,
-    QTableWidget, QTableWidgetItem, QTabWidget, QTextEdit, QVBoxLayout, QWidget
+    QMenu, QSystemTrayIcon, QTableWidget, QTableWidgetItem, QTabWidget, QTextEdit,
+    QVBoxLayout, QWidget
 )
 
 from auth import login, validate_token
@@ -51,7 +52,7 @@ FONTS_DIR = DATA_DIR.parent / "fonts"
 
 APP_STYLE = """
 QMainWindow, QDialog { background: @BG; }
-QWidget { color: @TEXT; font-family: "@SANS"; font-size: 13px; }
+QWidget { font-family: "@SANS"; font-size: 13px; }
 QLabel, QCheckBox { background: transparent; }
 QToolTip { background: @PANEL2; color: @TEXT; border: 1px solid @LINE; padding: 4px 6px; }
 
@@ -105,7 +106,7 @@ QProgressBar::chunk { background: @TEXT; border-radius: 3px; }
 QProgressBar#thick { border-radius: 6px; }
 QProgressBar#thick::chunk { border-radius: 6px; }
 
-QTableWidget { background: @PANEL; alternate-background-color: @PANEL; color: @TEXT;
+QTableWidget { background: @PANEL; alternate-background-color: @PANEL;
     border: 1px solid @LINE; border-radius: 10px; gridline-color: @ROW;
     selection-background-color: @ROW; selection-color: @TEXT; outline: 0; }
 QHeaderView { background: transparent; }
@@ -113,11 +114,11 @@ QHeaderView::section { background: @PANEL; color: @MUTED; border: 0;
     border-bottom: 1px solid @LINE; padding: 8px 10px; font-weight: 500; }
 QTableCornerButton::section { background: @PANEL; border: 0; }
 
-QListWidget { background: @PANEL; color: @TEXT; border: 1px solid @LINE;
+QListWidget { background: @PANEL; border: 1px solid @LINE;
     border-radius: 10px; padding: 4px; outline: 0; }
 QListWidget::item { padding: 9px 10px; border-radius: 6px; }
 QListWidget::item:hover { background: @PANEL2; }
-QListWidget::item:selected { background: @ROW; color: @TEXT; }
+QListWidget::item:selected { background: @ROW; }
 
 QTabWidget::pane { border: 0; border-top: 1px solid @LINE; }
 QTabBar { background: transparent; }
@@ -1022,8 +1023,15 @@ class MainWindow(QMainWindow):
         self._drop_img_slots = threading.Semaphore(4)  # at most 4 downloads at once
         self._drop_img_shown = ""
         self._games_list_sig: tuple | None = None
+        # Live-streamer check for the games-to-mine list: game(lower) -> bool
+        # (True has live streamers, False none, missing = not checked yet).
+        self._game_live: dict[str, bool] = {}
+        self._game_live_checked = 0.0
+        self._game_live_running = False
+        self._tray_hint_shown = False
 
         self._build_ui()
+        self._build_tray()
 
         # UI Refresher Timer — ticks every second so the drop-progress bar
         # can interpolate smoothly between real inventory refreshes.
@@ -1620,6 +1628,7 @@ class MainWindow(QMainWindow):
         for n in self.nodes.values():
             n.state.game_list = list(self.settings.game_list)
         self._games_list_sig = None
+        self._game_live_checked = 0.0  # re-check liveness promptly
 
     def _add_game(self) -> None:
         selected = self.home.combo_games.currentText().strip()
@@ -1672,16 +1681,27 @@ class MainWindow(QMainWindow):
         games = self.settings.game_list
         lst = self.home.list_games
         counts = tuple(sum(1 for n in self.nodes.values() if n.state.selected_game == g) for g in games)
-        sig = (tuple(games), counts)
+        live = tuple(self._game_live.get(g.lower()) for g in games)
+        sig = (tuple(games), counts, live)
         if sig != self._games_list_sig:
             self._games_list_sig = sig
             keep = self._selected_list_game()
             lst.clear()
             for i, g in enumerate(games):
-                c = counts[i]
-                tail = f" — {c} node{'s' if c != 1 else ''} mining" if c else ""
-                item = QListWidgetItem(f"{i + 1}. {g}{tail}")
+                is_live = live[i]
+                if is_live is True:
+                    color = C_OK
+                    status = (f"{counts[i]} node{'s' if counts[i] != 1 else ''} mining"
+                              if counts[i] else "live streamers")
+                elif is_live is False:
+                    color = C_FAIL
+                    status = "game not found"
+                else:
+                    color = C_TEXT
+                    status = "checking…" if self.nodes else ""
+                item = QListWidgetItem(f"{i + 1}. {g}" + (f" — {status}" if status else ""))
                 item.setData(Qt.ItemDataRole.UserRole, g)
+                item.setForeground(QColor(color))
                 lst.addItem(item)
                 if g == keep:
                     lst.setCurrentItem(item)
@@ -1900,11 +1920,83 @@ class MainWindow(QMainWindow):
             f"{len(drops)} drops — {ready} ready to claim, {in_prog} in progress, {claimed} claimed"
         )
 
+    # ---- games-to-mine liveness -------------------------------------------
+    def _maybe_check_games_live(self) -> None:
+        now = time.time()
+        if (self.nodes and self.settings.game_list and not self._game_live_running
+                and now - self._game_live_checked >= 60):
+            self._game_live_checked = now
+            self._game_live_running = True
+            threading.Thread(target=self._check_games_live, daemon=True).start()
+
+    def _check_games_live(self) -> None:
+        """BACKGROUND. For each game in the list, is anyone live streaming it?
+        Sets self._game_live[game]; the Home list then colors green/red."""
+        try:
+            node = next(iter(self.nodes.values()), None)
+            if node is None:
+                return
+            gql = node.node.gql
+            for g in list(self.settings.game_list):
+                try:
+                    _, channels = gql.get_live_channels_for_game(g)
+                    self._game_live[g.lower()] = bool(channels)
+                except Exception:
+                    pass  # leave the previous value on a transient error
+        finally:
+            self._game_live_running = False
+
+    # ---- system tray ------------------------------------------------------
+    def _build_tray(self) -> None:
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            self.tray = None
+            return
+        path = _app_icon_path()
+        icon = QIcon(path) if path else self.windowIcon()
+        self.tray = QSystemTrayIcon(icon, self)
+        self.tray.setToolTip("mournyl miner")
+        menu = QMenu()
+        menu.addAction("Show").triggered.connect(self._restore_from_tray)
+        menu.addSeparator()
+        menu.addAction("Quit").triggered.connect(self._quit_app)
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(self._tray_activated)
+        self.tray.show()
+
+    def _tray_activated(self, reason) -> None:
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:  # left click
+            self._restore_from_tray()
+
+    def _restore_from_tray(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _quit_app(self) -> None:
+        if getattr(self, "tray", None):
+            self.tray.hide()
+        QApplication.quit()
+
+    def changeEvent(self, event) -> None:
+        # Minimize sends the window to the tray instead of the taskbar.
+        if (event.type() == QEvent.Type.WindowStateChange
+                and getattr(self, "tray", None)
+                and self.windowState() & Qt.WindowState.WindowMinimized):
+            QTimer.singleShot(0, self.hide)
+            if not self._tray_hint_shown:
+                self._tray_hint_shown = True
+                self.tray.showMessage(
+                    "mournyl miner",
+                    "Still running — click the tray icon to restore, or Quit from its menu.",
+                    QSystemTrayIcon.MessageIcon.Information, 4000)
+        super().changeEvent(event)
+
     def update_ui_state(self) -> None:
         if self.tabs_main.currentIndex() == 0:
             self.home.refresh()
             self._refresh_games_dropdown()
             self._update_games_list()
+            self._maybe_check_games_live()
         for i in range(self.account_list_widget.count()):
             it = self.account_list_widget.item(i)
             n = self.nodes.get(it.text())
