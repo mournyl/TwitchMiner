@@ -2003,6 +2003,14 @@ class MainWindow(QMainWindow):
         if getattr(self, "tray", None):
             self.tray.hide()
         QApplication.quit()
+        # Force the process to actually terminate. QApplication.quit() only
+        # stops the Qt event loop; lingering daemon threads, open sockets or
+        # the tray can keep the exe alive in the task list, which hangs the
+        # update batch's "wait for exe to close" loop. A threading.Timer does
+        # not depend on the Qt loop (which is now stopping), so the hard exit
+        # fires regardless. os._exit is immediate and skips cleanup — correct
+        # here since we're quitting on purpose.
+        threading.Timer(0.4, lambda: os._exit(0)).start()
 
     # ---- updates ----------------------------------------------------------
     def _check_for_updates(self, manual: bool = False) -> None:
@@ -2104,6 +2112,13 @@ class MainWindow(QMainWindow):
         bat.write_text(
             "@echo off\r\n"
             "echo Updating mournyl miner...\r\n"
+            # The new exe must start as a fresh app, not as a child of the
+            # old one (whose unpacked temp folder is gone once it exits).
+            "set PYINSTALLER_RESET_ENVIRONMENT=1\r\n"
+            "set _PYI_APPLICATION_HOME_DIR=\r\n"
+            "set _PYI_ARCHIVE_FILE=\r\n"
+            "set _PYI_PARENT_PROCESS_LEVEL=\r\n"
+            "set _MEIPASS2=\r\n"
             # Bail out if the new exe somehow isn't there — never overwrite with nothing.
             f'if not exist "{new_exe}" (\r\n'
             '  echo Update files missing - aborting, your current version is untouched.\r\n'
@@ -2113,9 +2128,17 @@ class MainWindow(QMainWindow):
             '  del "%~f0"\r\n'
             '  exit /b\r\n'
             ')\r\n'
+            # Wait for the old exe to close, but never hang forever: after
+            # ~20s force-kill it so the update always proceeds.
+            "set waited=0\r\n"
             ":wait\r\n"
             f'tasklist /fi "imagename eq {exe_name}" | find /i "{exe_name}" >nul\r\n'
-            "if not errorlevel 1 ( timeout /t 1 /nobreak >nul & goto wait )\r\n"
+            "if errorlevel 1 goto gone\r\n"
+            "set /a waited+=1\r\n"
+            f'if %waited% geq 20 ( taskkill /f /im "{exe_name}" >nul 2>nul & timeout /t 2 /nobreak >nul & goto gone )\r\n'
+            "timeout /t 1 /nobreak >nul\r\n"
+            "goto wait\r\n"
+            ":gone\r\n"
             # Give Windows a moment to release the file lock after the process exits.
             "timeout /t 1 /nobreak >nul\r\n"
             # Replace the exe (retry a few times in case AV/lock is slow to clear).
@@ -2129,13 +2152,15 @@ class MainWindow(QMainWindow):
             # Refresh the fonts folder if the update shipped one.
             f'if exist "{src_dir}\\fonts" xcopy /E /Y /I "{src_dir}\\fonts" "{app_dir}\\fonts" >nul\r\n'
             f'if exist "{src_dir}\\assets" xcopy /E /Y /I "{src_dir}\\assets" "{app_dir}\\assets" >nul\r\n'
-            # Clear stale onefile extraction folders so the new exe unpacks clean.
-            'for /d %%D in ("%TEMP%\\_MEI*") do rmdir /s /q "%%D" 2>nul\r\n'
             f'rmdir /s /q "{stage}" 2>nul\r\n'
             f'start "" "{app_dir}\\{exe_name}"\r\n'
             'del "%~f0"\r\n',
             encoding="utf-8")
-        subprocess.Popen(["cmd", "/c", str(bat)], creationflags=0x00000010)  # CREATE_NEW_CONSOLE
+        env = {k: v for k, v in os.environ.items()
+               if not (k.startswith("_PYI_") or k == "_MEIPASS2")}
+        env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+        subprocess.Popen(["cmd", "/c", str(bat)], env=env,
+                         creationflags=0x00000010)  # CREATE_NEW_CONSOLE
         self._quit_app()
 
     def _apply_source_update(self) -> None:
